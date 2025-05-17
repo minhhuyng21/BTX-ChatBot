@@ -6,45 +6,114 @@ from langchain.chains import RetrievalQA
 from langchain_openai import ChatOpenAI ,OpenAIEmbeddings
 from langchain_community.utilities import SQLDatabase
 from langchain.agents import create_sql_agent
-from langchain.agents.agent_toolkits import SQLDatabaseToolkit
 import time
 import speech_recognition as sr
 from dotenv import load_dotenv
+# Thay thế các imports cũ
+from langchain_community.agent_toolkits.sql.toolkit import SQLDatabaseToolkit
+from langchain.agents import create_openai_tools_agent  # Thêm import mới này
+from langchain_core.prompts import ChatPromptTemplate
+from langchain.agents import AgentExecutor
+from langchain_core.vectorstores import InMemoryVectorStore
+import json
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain import hub
+from langgraph.graph import START, StateGraph
+from typing_extensions import List, TypedDict
+with open("docs.json", "r", encoding="utf-8") as f:
+    raw = json.load(f)
 
+# Tạo lại list Document
+docs = [Document(page_content=item["page_content"],
+                 metadata=item["metadata"])
+        for item in raw]
+CUSTOM_SYSTEM_PROMPT = """[Phiên bản mới] Bạn là hệ thống trợ lý ảo Trường THPT Bùi Thị Xuân. Khi xử lý truy vấn SQL:
+{agent_scratchpad}  # Thêm placeholder này vào prompt
+
+Cấu trúc database:
+- ThoiKhoaBieu (Thu, Tiet, Phong, MonHoc, TenGV, Lop)
+- GiaoVien (MaGV, TenGV, MonDay, LopChuNhiem)
+- Lop (MaLop, TenLop, SiSo, GVCN)
+- HocSinh(Lop, MaSo, Hoten, NgaySinh)
+
+Quy tắc:
+1. Luôn kiểm tra tên bảng/cột trước khi truy vấn
+2. Sử dụng toán tử LIKE cho các trường hợp không rõ ràng
+3. Nếu kết quả trống, đề xuất các truy vấn thay thế
+"""
 load_dotenv()
 SQL_KEYWORDS = [
-    "thời khóa biểu","tkb", "giáo viên", "giáo viên chủ nhiệm",
-    "lớp", "tiết", "phòng", "tiết học", "môn","thứ","cô","thầy","học sinh"
+    "thời khóa biểu","tkb", "giáo viên chủ nhiệm",
+    "lớp", "tiết", "phòng", "tiết học", "môn","thứ","cô", "thầy","ai","tên", "số lượng"
 ]
 OPENAI_API_KEY = os.getenv('OPENAI')
-
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
+@st.cache_resource
 def load_model():
     os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-    llm = ChatOpenAI(model="gpt-4o-2024-11-20")
-    embedding_model = OpenAIEmbeddings(model="text-embedding-ada-002")
+    llm = ChatOpenAI(model="gpt-4o")
+    embedding_model = OpenAIEmbeddings(model="text-embedding-3-small")
 
-    template = """<|im_start|>system
-    Sử dụng thông tin sau đây để trả lời câu hỏi. Nếu bạn không biết câu trả lời, hãy nói: "xin lỗi vì có thể dữ liệu này chưa được cập nhật".
-    {context}<|im_end|>
-    <|im_start|>user
-    {question}<|im_end|>
-    <|im_start|>assistant"""
-
-    prompt = PromptTemplate(template=template, input_variables=["context", "question"])
+    vector_store = InMemoryVectorStore(embedding_model)
+    prompt = hub.pull("rlm/rag-prompt")
     db = FAISS.load_local("faiss", embedding_model, allow_dangerous_deserialization=True)
-    llm_chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever = db.as_retriever(search_kwargs={"k": 3}, max_tokens_limit=1024),
-        return_source_documents=False,
-        chain_type_kwargs={'prompt': prompt}
-    )
-    # Gọi mô hình LLM để lấy phản hồi
-    sql = SQLDatabase.from_uri("sqlite:///tkb_sql.db")
-    toolkit = SQLDatabaseToolkit(db=sql, llm=llm)
-    agent_executor = create_sql_agent(llm, db=sql, agent_type="openai-tools", verbose=True)
-    return llm_chain, agent_executor
+    
+    retriever = db.as_retriever(search_kwargs={"k": 3})
+    _ = vector_store.add_documents(documents=docs)
+    class State(TypedDict):
+        question: str
+        context: List[Document]
+        answer: str
 
+    # Define application steps
+    def retrieve(state: State):
+        retrieved_docs = vector_store.similarity_search(state["question"])
+        return {"context": retrieved_docs}
+
+
+    def generate(state: State):
+        docs_content = "\n\n".join(doc.page_content for doc in state["context"])
+        messages = prompt.invoke({"question": state["question"], "context": docs_content})
+        response = llm.invoke(messages)
+        return {"answer": response.content}
+
+
+    # Compile application and test
+    graph_builder = StateGraph(State).add_sequence([retrieve, generate])
+    graph_builder.add_edge(START, "retrieve")
+    graph = graph_builder.compile()
+
+    # SQL Agent
+    sql = SQLDatabase.from_uri("sqlite:///sql_new.db")
+    sql_prompt = ChatPromptTemplate.from_messages([
+        ("system", CUSTOM_SYSTEM_PROMPT),
+        ("human", "{input}"),
+        ("placeholder", "{agent_scratchpad}"),
+    ])
+
+    sql_agent = create_sql_agent(
+        llm=llm,
+        db=sql,
+        prompt=sql_prompt,
+        agent_type="openai-tools",
+        verbose=True,
+        handle_parsing_errors=True,
+    )
+
+    return graph, sql_agent
+
+# In your main function:
+def response_generator(user_input):
+    # First try RAG chain
+    try:
+        # response = st.session_state['rag_chain'].invoke(user_input + " và trả lời bằng tiếng việt")
+        response = st.session_state['rag_chain'].invoke({"question": user_input + " và trả lời bằng tiếng việt"})
+        return response
+    except Exception as e:
+        # Fallback to SQL agent
+        return st.session_state['sql_agent'].invoke({"input": user_input})
 
 def is_sql_query(user_input: str) -> bool:
     text = user_input.lower()
@@ -60,10 +129,9 @@ def response_generator(user_input):
             answer = "Có lỗi truy vấn dữ liệu, vui lòng thử lại."
     else:
         # 2b. Dùng LLM
-        print('in')
         try:
-            response = st.session_state['model'].invoke({"query": user_input + " và trả lời bằng tiếng việt"})
-            answer = response['result']
+            response = st.session_state['model'].invoke({"question": user_input + " và trả lời bằng tiếng việt"})
+            answer = response['answer']
         except:
             answer = "Có lỗi xử lý ngôn ngữ, vui lòng thử lại."
 
